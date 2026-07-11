@@ -1,11 +1,14 @@
 // ============================================
 // server.js - WhatsApp Multi-Account Backend
+// Render Deployment Ready
 // ============================================
 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
+const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
 // Baileys imports
@@ -16,51 +19,76 @@ const {
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     Browsers
-} = require('@adiwajshing/baileys');
+} = require('@whiskeysockets/baileys');
 
 const pino = require('pino');
-const NodeCache = require('node-cache'); // You may need to install this
 
 // Initialize Express
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ============================================
+// RENDER SPECIFIC SETUP
+// ============================================
+
+// Create sessions directory if it doesn't exist
+const sessionsDir = process.env.SESSIONS_DIR || './sessions';
+if (!fs.existsSync(sessionsDir)) {
+    fs.mkdirSync(sessionsDir, { recursive: true });
+}
+
+// Use /tmp for sessions on Render (ephemeral storage)
+const isRender = process.env.RENDER === 'true';
+const sessionPath = isRender ? '/tmp/sessions' : sessionsDir;
+
+if (!fs.existsSync(sessionPath)) {
+    fs.mkdirSync(sessionPath, { recursive: true });
+}
+
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    credentials: true
+}));
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ============================================
+// HEALTH CHECK (Render requires this)
+// ============================================
+
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        memory: process.memoryUsage()
+    });
+});
+
+// ============================================
 // STATE MANAGEMENT
 // ============================================
 
-// Store active WhatsApp sessions
-const sessions = new Map(); // Map<sessionId, { sock, state, creds, keys }>
-const connectionStates = new Map(); // Map<sessionId, { status, phone, qr, pairCode }>
-const pendingConnections = new Map(); // Map<sessionId, { method, timeout }>
-
-// Store messages (in production, use a database)
-const messageStore = new Map(); // Map<accountId, Array<messages>>
+const sessions = new Map();
+const connectionStates = new Map();
+const pendingConnections = new Map();
+const messageStore = new Map();
 
 // ============================================
 // BAILEYS SESSION MANAGEMENT
 // ============================================
 
-/**
- * Creates a new WhatsApp session
- * @param {string} sessionId - Unique session identifier
- * @returns {Object} Session object
- */
 async function createSession(sessionId) {
     try {
-        // Use file-based auth state
-        const { state, saveCreds } = await useMultiFileAuthState(`sessions/${sessionId}`);
+        const { state, saveCreds } = await useMultiFileAuthState(
+            path.join(sessionPath, sessionId)
+        );
         
-        // Fetch latest Baileys version
         const { version } = await fetchLatestBaileysVersion();
         
-        // Create socket connection
         const sock = makeWASocket({
             version,
             auth: {
@@ -73,7 +101,6 @@ async function createSession(sessionId) {
             syncFullHistory: false
         });
         
-        // Store session data
         sessions.set(sessionId, {
             sock,
             state,
@@ -82,7 +109,6 @@ async function createSession(sessionId) {
             keys: state.keys
         });
         
-        // Set up event handlers
         setupEventHandlers(sessionId, sock, saveCreds);
         
         return sock;
@@ -92,28 +118,20 @@ async function createSession(sessionId) {
     }
 }
 
-/**
- * Sets up event handlers for a WhatsApp socket
- */
 function setupEventHandlers(sessionId, sock, saveCreds) {
-    
-    // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            // QR code received - connection is waiting
             const qrCode = await generateQRCode(qr);
             connectionStates.set(sessionId, {
                 ...connectionStates.get(sessionId),
                 status: 'qr',
                 qr: qrCode
             });
-            console.log(`[${sessionId}] QR Code generated`);
         }
         
         if (connection === 'open') {
-            // Connection successful
             const phoneNumber = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
             connectionStates.set(sessionId, {
                 status: 'connected',
@@ -121,16 +139,12 @@ function setupEventHandlers(sessionId, sock, saveCreds) {
                 connectedAt: new Date().toISOString()
             });
             
-            // Initialize message store for this account
             if (!messageStore.has(sessionId)) {
                 messageStore.set(sessionId, []);
             }
-            
-            console.log(`[${sessionId}] Connected as ${sock.user?.name || phoneNumber}`);
         }
         
         if (connection === 'close') {
-            // Connection closed
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
@@ -139,29 +153,21 @@ function setupEventHandlers(sessionId, sock, saveCreds) {
                 status: 'disconnected'
             });
             
-            console.log(`[${sessionId}] Connection closed. Reconnecting: ${shouldReconnect}`);
-            
             if (shouldReconnect) {
-                // Attempt to reconnect
-                setTimeout(() => createSession(sessionId), 3000);
+                setTimeout(() => createSession(sessionId), 5000);
             } else {
-                // User logged out
                 sessions.delete(sessionId);
                 connectionStates.delete(sessionId);
-                console.log(`[${sessionId}] Session terminated`);
             }
         }
     });
     
-    // Handle credential updates
     sock.ev.on('creds.update', saveCreds);
     
-    // Handle incoming messages
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         
         if (!msg.key.fromMe && msg.message) {
-            // Incoming message
             const messageText = msg.message.conversation || 
                               msg.message.extendedTextMessage?.text || 
                               'Media message';
@@ -174,24 +180,18 @@ function setupEventHandlers(sessionId, sock, saveCreds) {
                 direction: 'received'
             };
             
-            // Store message
             const messages = messageStore.get(sessionId) || [];
             messages.push(messageData);
-            messageStore.set(sessionId, messages.slice(-100)); // Keep last 100 messages
-            
-            console.log(`[${sessionId}] Message from ${msg.key.remoteJid}: ${messageText}`);
+            messageStore.set(sessionId, messages.slice(-100));
         }
     });
 }
 
-/**
- * Generates QR code as base64 image
- */
 async function generateQRCode(qrString) {
     try {
         const QRCode = require('qrcode');
         const qrImage = await QRCode.toDataURL(qrString);
-        return qrImage.split(',')[1]; // Return base64 without header
+        return qrImage.split(',')[1];
     } catch (error) {
         console.error('Error generating QR code:', error);
         throw error;
@@ -202,10 +202,6 @@ async function generateQRCode(qrString) {
 // API ROUTES
 // ============================================
 
-/**
- * GET /api/accounts
- * Returns all connected accounts
- */
 app.get('/api/accounts', (req, res) => {
     const accounts = [];
     
@@ -223,24 +219,17 @@ app.get('/api/accounts', (req, res) => {
     res.json(accounts);
 });
 
-/**
- * POST /api/connect/qr
- * Initiates QR code connection
- */
 app.post('/api/connect/qr', async (req, res) => {
     try {
         const sessionId = uuidv4();
         
-        // Initialize connection state
         connectionStates.set(sessionId, {
             status: 'initializing',
             method: 'qr'
         });
         
-        // Create session (this will generate QR code)
         await createSession(sessionId);
         
-        // Set timeout for connection (2 minutes)
         const timeout = setTimeout(() => {
             if (connectionStates.get(sessionId)?.status !== 'connected') {
                 connectionStates.set(sessionId, {
@@ -250,7 +239,7 @@ app.post('/api/connect/qr', async (req, res) => {
                 sessions.delete(sessionId);
             }
             pendingConnections.delete(sessionId);
-        }, 120000);
+        }, 180000); // 3 minutes for Render
         
         pendingConnections.set(sessionId, { method: 'qr', timeout });
         
@@ -269,10 +258,6 @@ app.post('/api/connect/qr', async (req, res) => {
     }
 });
 
-/**
- * POST /api/connect/pair
- * Initiates pair code connection
- */
 app.post('/api/connect/pair', async (req, res) => {
     try {
         const sessionId = uuidv4();
@@ -282,22 +267,18 @@ app.post('/api/connect/pair', async (req, res) => {
             return res.status(400).json({ message: 'Phone number required' });
         }
         
-        // Initialize connection state
         connectionStates.set(sessionId, {
             status: 'initializing',
             method: 'pair'
         });
         
-        // Create session first
         await createSession(sessionId);
         
-        // Request pair code
         const sock = sessions.get(sessionId)?.sock;
         if (!sock) {
             throw new Error('Failed to create session');
         }
         
-        // Request pairing code (Note: This feature may vary based on Baileys version)
         const code = await sock.requestPairingCode(phoneNumber);
         
         connectionStates.set(sessionId, {
@@ -306,7 +287,6 @@ app.post('/api/connect/pair', async (req, res) => {
             pairCode: code
         });
         
-        // Set timeout
         const timeout = setTimeout(() => {
             if (connectionStates.get(sessionId)?.status !== 'connected') {
                 connectionStates.set(sessionId, {
@@ -316,7 +296,7 @@ app.post('/api/connect/pair', async (req, res) => {
                 sessions.delete(sessionId);
             }
             pendingConnections.delete(sessionId);
-        }, 120000);
+        }, 180000);
         
         pendingConnections.set(sessionId, { method: 'pair', timeout });
         
@@ -336,10 +316,6 @@ app.post('/api/connect/pair', async (req, res) => {
     }
 });
 
-/**
- * GET /api/connection-status/:sessionId
- * Polls connection status
- */
 app.get('/api/connection-status/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const state = connectionStates.get(sessionId);
@@ -357,26 +333,20 @@ app.get('/api/connection-status/:sessionId', (req, res) => {
         qr: state.qr || null,
         pairCode: state.pairCode || null,
         phone: state.phone || null,
-        id: sessionId // Client expects this on successful connection
+        id: sessionId
     });
 });
 
-/**
- * POST /api/send-message
- * Sends a WhatsApp message
- */
 app.post('/api/send-message', async (req, res) => {
     try {
         const { id, to, text } = req.body;
         
-        // Validate inputs
         if (!id || !to || !text) {
             return res.status(400).json({
                 message: 'Missing required fields: id, to, text'
             });
         }
         
-        // Get session
         const session = sessions.get(id);
         if (!session || !session.sock) {
             return res.status(404).json({
@@ -384,11 +354,9 @@ app.post('/api/send-message', async (req, res) => {
             });
         }
         
-        // Send message
         const sock = session.sock;
         const result = await sock.sendMessage(to, { text });
         
-        // Store sent message
         const messages = messageStore.get(id) || [];
         messages.push({
             id: result.key.id,
@@ -414,46 +382,34 @@ app.post('/api/send-message', async (req, res) => {
     }
 });
 
-/**
- * GET /api/messages/:accountId
- * Returns message history for an account
- */
 app.get('/api/messages/:accountId', (req, res) => {
     const { accountId } = req.params;
     const messages = messageStore.get(accountId) || [];
     
     res.json({
         accountId,
-        messages: messages.slice(-50), // Return last 50 messages
+        messages: messages.slice(-50),
         total: messages.length
     });
 });
 
-/**
- * POST /api/disconnect/:accountId
- * Disconnects an account
- */
 app.post('/api/disconnect/:accountId', async (req, res) => {
     try {
         const { accountId } = req.params;
         const session = sessions.get(accountId);
         
         if (session && session.sock) {
-            // Logout and close connection
             await session.sock.logout();
             await session.sock.end();
         }
         
-        // Clean up
         sessions.delete(accountId);
         connectionStates.delete(accountId);
         messageStore.delete(accountId);
         
-        // Clean up session files (optional)
-        const fs = require('fs').promises;
-        const sessionPath = `./sessions/${accountId}`;
+        const sessionFilePath = path.join(sessionPath, accountId);
         try {
-            await fs.rm(sessionPath, { recursive: true, force: true });
+            fs.rmSync(sessionFilePath, { recursive: true, force: true });
         } catch (err) {
             console.error('Error deleting session files:', err);
         }
@@ -472,27 +428,24 @@ app.post('/api/disconnect/:accountId', async (req, res) => {
     }
 });
 
-/**
- * GET /api/health
- * Health check endpoint
- */
-app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        activeSessions: sessions.size,
-        connectedAccounts: Array.from(connectionStates.values())
-            .filter(s => s.status === 'connected').length
-    });
-});
-
 // ============================================
 // SERVE FRONTEND
 // ============================================
 
-// Serve the main HTML file for all other routes
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ============================================
+// ERROR HANDLING
+// ============================================
+
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    res.status(500).json({
+        message: 'Internal server error',
+        error: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+    });
 });
 
 // ============================================
@@ -502,27 +455,25 @@ app.get('*', (req, res) => {
 app.listen(PORT, () => {
     console.log(`
     ╔════════════════════════════════════════╗
-    ║   WhatsApp Multi-Account Manager       ║
-    ║   Server running on port ${PORT}         ║
-    ║   http://localhost:${PORT}              ║
+    ║   WhatsApp Manager - Render Deploy     ║
+    ║   Port: ${PORT}                        ║
+    ║   Environment: ${process.env.NODE_ENV || 'production'}     ║
+    ║   Sessions: ${sessionPath}              ║
     ╚════════════════════════════════════════╝
     `);
 });
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\nShutting down gracefully...');
+process.on('SIGTERM', async () => {
+    console.log('SIGTERM received. Closing sessions...');
     
-    // Disconnect all sessions
     for (const [sessionId, session] of sessions) {
         try {
-            await session.sock.logout();
             await session.sock.end();
         } catch (error) {
-            console.error(`Error disconnecting ${sessionId}:`, error);
+            console.error(`Error closing session ${sessionId}:`, error);
         }
     }
     
-    console.log('All sessions closed. Goodbye!');
     process.exit(0);
 });
