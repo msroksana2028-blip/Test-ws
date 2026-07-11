@@ -465,6 +465,21 @@
                 
                 <!-- Pair Code Container -->
                 <div id="pair-code-container" class="hidden mb-6">
+                    <!-- Phone Number Input (for Pair Code) -->
+                    <div id="phone-input-container" class="mb-4">
+                        <label class="block text-sm font-medium text-gray-400 mb-2">
+                            <i class="fas fa-phone mr-1"></i>
+                            Phone Number (with country code)
+                        </label>
+                        <input type="text" 
+                               id="phone-number-input" 
+                               placeholder="Example: 8801712345678"
+                               class="w-full bg-gray-700 border border-gray-600 rounded-lg py-3 px-4 text-white text-lg">
+                        <p class="text-xs text-gray-500 mt-1">
+                            Enter your WhatsApp number without + or spaces
+                        </p>
+                    </div>
+                    
                     <div id="pair-code-content" class="text-center">
                         <!-- Pair code will be displayed here -->
                     </div>
