@@ -26,7 +26,7 @@ const pino = require('pino');
 // CONFIGURATION
 // ============================================
 
-const GROQ_API_KEY = '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';
+const GROQ_API_KEY = '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';
 const PORT = process.env.PORT || 10000;
 const SESSIONS_DIR = process.env.RENDER ? '/tmp/sessions' : './sessions';
 
