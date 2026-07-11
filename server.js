@@ -261,13 +261,36 @@ app.post('/api/connect/qr', async (req, res) => {
             method: 'qr'
         });
         
-        // Create session (this will generate QR code)
+        // Create session - QR will be generated via event handler
         await createSession(sessionId);
         
-        // Set timeout for connection (3 minutes)
+        // Wait briefly for QR to be generated
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // Get the generated QR code
+        const state = connectionStates.get(sessionId);
+        
+        if (state && state.qr) {
+            // QR is ready
+            res.json({
+                sessionId: sessionId,
+                qr: state.qr,
+                status: 'qr_ready',
+                message: 'QR code generated successfully'
+            });
+        } else {
+            // QR not ready yet, but session is created
+            res.json({
+                sessionId: sessionId,
+                status: 'waiting_for_qr',
+                message: 'Session created, waiting for QR code'
+            });
+        }
+        
+        // Set timeout for connection (5 minutes)
         const timeout = setTimeout(() => {
-            const state = connectionStates.get(sessionId);
-            if (state && state.status !== 'connected') {
+            const currentState = connectionStates.get(sessionId);
+            if (currentState && currentState.status !== 'connected') {
                 connectionStates.set(sessionId, {
                     status: 'timeout',
                     method: 'qr'
@@ -275,15 +298,9 @@ app.post('/api/connect/qr', async (req, res) => {
                 sessions.delete(sessionId);
             }
             pendingConnections.delete(sessionId);
-        }, 180000);
+        }, 300000); // 5 minutes
         
         pendingConnections.set(sessionId, { method: 'qr', timeout });
-        
-        res.json({
-            sessionId,
-            status: 'initializing',
-            message: 'QR code session created'
-        });
         
     } catch (error) {
         console.error('QR connection error:', error);
@@ -378,8 +395,9 @@ app.get('/api/connection-status/:sessionId', (req, res) => {
         });
     }
     
+    // Return complete state including QR if available
     res.json({
-        sessionId,
+        sessionId: sessionId,
         status: state.status,
         qr: state.qr || null,
         pairCode: state.pairCode || null,
