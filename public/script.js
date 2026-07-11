@@ -255,61 +255,44 @@ function closeAddAccountModal() {
 // ============================================
 
 /**
- * Initiates WhatsApp connection using selected method
- */
-async function initiateConnection() {
-    const method = connectButton.dataset.method;
-    
-    // Update UI to show connecting state
-    connectButton.textContent = 'Connecting...';
-    connectButton.disabled = true;
-    
-    try {
-        // Determine API endpoint based on method
-        const endpoint = method === 'qr' ? '/api/connect/qr' : '/api/connect/pair';
-        const response = await fetch(endpoint, { method: 'POST' });
-        
-        // Handle HTTP errors
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.message || 'Connection failed');
-        }
-        
-        const data = await response.json();
-        
-        // Store session info for polling
-        pendingSessionId = data.sessionId;
-        pendingMethod = method;
-        
-        // Display connection method specific UI
-        if (method === 'qr') {
-            displayQRCode(data.qr);
-        } else if (method === 'pair') {
-            displayPairCode(data.pairCode);
-        }
-        
-        // Start polling for connection status
-        startPolling(data.sessionId, method);
-        
-    } catch (error) {
-        console.error('Connection error:', error);
-        handleConnectionError(error.message);
-    }
-}
-
-/**
  * Displays QR code in the modal
  * @param {string} qrBase64 - Base64 encoded QR code image
  */
 function displayQRCode(qrBase64) {
+    if (!qrBase64) {
+        console.error('No QR code data received');
+        return;
+    }
+    
+    console.log('Displaying QR code...');
+    
     qrCodeContent.innerHTML = `
         <div class="text-center">
-            <img src="data:image/png;base64,${qrBase64}" 
-                 alt="WhatsApp QR Code" 
-                 class="mx-auto w-64 h-64 border-2 border-green-500 rounded-lg">
-            <p class="text-sm text-gray-400 mt-2">Scan with WhatsApp on your phone</p>
+            <div class="bg-white p-4 rounded-lg inline-block">
+                <img src="data:image/png;base64,${qrBase64}" 
+                     alt="WhatsApp QR Code" 
+                     class="qr-code-image mx-auto"
+                     style="width: 256px; height: 256px; image-rendering: pixelated;"
+                     onerror="this.parentElement.innerHTML='<p class=\\'text-red-500 p-4\\'>Failed to load QR code</p>'">
+            </div>
+            <p class="text-sm text-gray-400 mt-3">
+                <i class="fab fa-whatsapp mr-1"></i>
+                Open WhatsApp on your phone
+            </p>
+            <p class="text-xs text-gray-500 mt-1">
+                Go to Settings → Linked Devices → Link a Device
+            </p>
+            <div class="mt-3">
+                <span class="inline-block w-3 h-3 bg-yellow-500 rounded-full animate-pulse"></span>
+                <span class="text-sm text-yellow-500 ml-2">Waiting for scan...</span>
+            </div>
         </div>
     `;
+    
+    // Show refresh button
+    if (refreshQrButton) {
+        refreshQrButton.classList.remove('hidden');
+    }
 }
 
 /**
@@ -323,55 +306,6 @@ function displayPairCode(code) {
 }
 
 /**
- * Starts polling for connection status
- * @param {string} sessionId - Session to poll for
- * @param {string} method - Connection method used
- */
-function startPolling(sessionId, method) {
-    // Clear any existing polling
-    stopPolling();
-    
-    // Start new polling interval (every 2 seconds)
-    currentPollingInterval = setInterval(async () => {
-        try {
-            const response = await fetch(`/api/connection-status/${sessionId}`);
-            
-            if (!response.ok) {
-                throw new Error('Status check failed');
-            }
-            
-            const data = await response.json();
-            
-            // Handle different connection states
-            switch (data.status) {
-                case 'connected':
-                    handleSuccessfulConnection(data);
-                    break;
-                    
-                case 'error':
-                case 'disconnected':
-                case 'timeout':
-                    handleFailedConnection(data.status);
-                    break;
-                    
-                case 'connecting':
-                case 'qr_read':
-                    // Still waiting, continue polling
-                    console.log(`Connection status: ${data.status}`);
-                    break;
-                    
-                default:
-                    console.log('Unknown status:', data.status);
-            }
-            
-        } catch (error) {
-            console.error('Polling error:', error);
-            handleConnectionError('Lost connection to server');
-        }
-    }, 2000); // Poll every 2 seconds
-}
-
-/**
  * Stops the active polling interval
  */
 function stopPolling() {
@@ -382,20 +316,110 @@ function stopPolling() {
 }
 
 /**
+ * Starts polling for QR code and connection status
+ */
+function startPollingForQR(sessionId, method) {
+    // Clear any existing polling
+    stopPolling();
+    
+    let attempts = 0;
+    const maxAttempts = 60; // 2 minutes max
+    
+    currentPollingInterval = setInterval(async () => {
+        try {
+            attempts++;
+            
+            if (attempts > maxAttempts) {
+                stopPolling();
+                handleConnectionError('Connection timeout - please try again');
+                return;
+            }
+            
+            const response = await fetch(`/api/connection-status/${sessionId}`);
+            
+            if (!response.ok) {
+                throw new Error('Status check failed');
+            }
+            
+            const data = await response.json();
+            console.log('Polling status:', data.status, 'Attempt:', attempts);
+            
+            // Handle different statuses
+            switch (data.status) {
+                case 'qr':
+                case 'qr_ready':
+                    // QR code is available
+                    if (data.qr) {
+                        displayQRCode(data.qr);
+                        connectButton.textContent = 'Scan QR Code with WhatsApp';
+                        connectButton.disabled = false;
+                    }
+                    break;
+                    
+                case 'waiting_for_qr':
+                    // Still waiting for QR
+                    if (attempts % 5 === 0) { // Update message every 5 attempts
+                        qrCodeContent.innerHTML = `
+                            <div class="text-center">
+                                <div class="spinner mx-auto"></div>
+                                <p class="text-gray-400 mt-4">Generating QR Code...</p>
+                                <p class="text-sm text-gray-500 mt-2">Attempt ${attempts}/${maxAttempts}</p>
+                            </div>
+                        `;
+                    }
+                    break;
+                    
+                case 'connected':
+                    // Connection successful!
+                    stopPolling();
+                    handleSuccessfulConnection(data);
+                    break;
+                    
+                case 'timeout':
+                    // Connection timed out
+                    stopPolling();
+                    handleFailedConnection('timeout');
+                    break;
+                    
+                case 'error':
+                    // Error occurred
+                    stopPolling();
+                    handleFailedConnection('error');
+                    break;
+                    
+                default:
+                    console.log('Unknown status:', data.status);
+                    break;
+            }
+            
+        } catch (error) {
+            console.error('Polling error:', error);
+            if (attempts > 10) { // Only stop after multiple failures
+                stopPolling();
+                handleConnectionError('Lost connection to server');
+            }
+        }
+    }, 3000); // Poll every 3 seconds
+}
+
+/**
  * Handles successful WhatsApp connection
  * @param {object} data - Connection response data
  */
 function handleSuccessfulConnection(data) {
+    console.log('Connection successful!', data);
+    
     // Stop polling
     stopPolling();
     
-    // Update local state with new account
+    // Update local state
     const newAccount = {
         id: data.id,
-        phone: data.phone,
+        phone: data.phone || 'Connected Account',
         status: 'connected',
-        name: data.name || data.phone
+        name: data.phone
     };
+    
     accountsData.set(data.id, newAccount);
     
     // Close modal
@@ -405,9 +429,9 @@ function handleSuccessfulConnection(data) {
     displayAccountDetails(data.id);
     
     // Show success notification
-    showNotification('Account connected successfully!', 'success');
+    showNotification('WhatsApp account connected successfully!', 'success');
     
-    // Reset connect button (for next use)
+    // Reset button
     connectButton.textContent = "Connect with QR Code";
     connectButton.disabled = false;
 }
@@ -774,17 +798,121 @@ function setupEventListeners() {
         pairCodeTab.addEventListener('click', showPairCodeSection);
     }
     
-    // Connect button
+    // ============================================
+    // FIXED: Connect Button Handler
+    // ============================================
+    
     if (connectButton) {
-        connectButton.addEventListener('click', initiateConnection);
+        connectButton.addEventListener('click', async () => {
+            const method = connectButton.dataset.method;
+            
+            // Update UI
+            connectButton.textContent = 'Generating QR Code...';
+            connectButton.disabled = true;
+            
+            try {
+                let response;
+                if (method === 'qr') {
+                    response = await fetch('/api/connect/qr', { 
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                } else if (method === 'pair') {
+                    const phoneNumber = prompt('Enter phone number with country code:');
+                    if (!phoneNumber) {
+                        connectButton.textContent = `Connect with Pair Code`;
+                        connectButton.disabled = false;
+                        return;
+                    }
+                    response = await fetch('/api/connect/pair', { 
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ phoneNumber })
+                    });
+                } else {
+                    throw new Error("Unknown connection method");
+                }
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.message || 'Connection failed');
+                }
+
+                const data = await response.json();
+                console.log('Connection response:', data);
+                
+                // Store session info
+                pendingSessionId = data.sessionId;
+                pendingMethod = method;
+                
+                if (method === 'qr') {
+                    connectButton.textContent = 'Waiting for QR Code...';
+                    
+                    // Try to display QR immediately if available
+                    if (data.qr) {
+                        displayQRCode(data.qr);
+                        connectButton.textContent = 'Scan QR Code with WhatsApp';
+                    } else {
+                        // QR not ready yet, start polling for it
+                        qrCodeContent.innerHTML = `
+                            <div class="text-center">
+                                <div class="spinner mx-auto"></div>
+                                <p class="text-gray-400 mt-4">Generating QR Code...</p>
+                                <p class="text-sm text-gray-500 mt-2">This may take a few seconds</p>
+                            </div>
+                        `;
+                    }
+                    
+                } else if (method === 'pair') {
+                    if (data.pairCode) {
+                        displayPairCode(data.pairCode);
+                        connectButton.textContent = 'Enter Code in WhatsApp';
+                    }
+                }
+                
+                // Start polling for connection status AND QR code
+                startPollingForQR(data.sessionId, method);
+                
+            } catch (error) {
+                console.error('Error initiating connection:', error);
+                showNotification('Connection failed: ' + error.message, 'error');
+                
+                // Reset button
+                connectButton.textContent = `Connect with ${method === 'qr' ? 'QR Code' : 'Pair Code'}`;
+                connectButton.disabled = false;
+            }
+        });
     }
     
-    // Refresh QR button
+    // ============================================
+    // FIXED: Refresh QR Button Handler
+    // ============================================
+    
     if (refreshQrButton) {
-        refreshQrButton.addEventListener('click', () => {
-            if (pendingSessionId && pendingMethod) {
-                initiateConnection(); // Re-initiate connection
+        refreshQrButton.addEventListener('click', async () => {
+            if (!pendingSessionId) return;
+            
+            refreshQrButton.disabled = true;
+            refreshQrButton.textContent = 'Refreshing...';
+            
+            // Restart connection
+            try {
+                await fetch(`/api/disconnect/${pendingSessionId}`, { method: 'POST' });
+            } catch (e) {
+                // Ignore disconnect errors
             }
+            
+            // Trigger new connection
+            connectButton.click();
+            
+            setTimeout(() => {
+                refreshQrButton.disabled = false;
+                refreshQrButton.textContent = 'Refresh QR Code';
+            }, 2000);
         });
     }
     
@@ -846,7 +974,6 @@ if (typeof module !== 'undefined' && module.exports) {
         addMessageToLog,
         showQrCodeSection,
         showPairCodeSection,
-        initiateConnection,
         handleSendMessage,
         disconnectAccount,
         fetchAccounts
