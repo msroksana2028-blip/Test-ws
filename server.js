@@ -1,23 +1,22 @@
 // ============================================
-// server.js - WhatsApp Multi-Account Backend
-// FIXED: Pair Code Priority + QR Code Support
+// server.js - WORKING PAIR CODE SOLUTION
+// Based on latest @whiskeysockets/baileys docs
 // ============================================
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
+// Baileys imports
 const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore,
-    Browsers
+    makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 
 const pino = require('pino');
@@ -25,19 +24,16 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ============================================
-// BASIC SETUP
+// SETUP
 // ============================================
 
-const isRender = process.env.RENDER === 'true';
-const sessionPath = isRender ? '/tmp/sessions' : './sessions';
-
+const sessionPath = process.env.RENDER ? '/tmp/sessions' : './sessions';
 if (!fs.existsSync(sessionPath)) {
     fs.mkdirSync(sessionPath, { recursive: true });
 }
 
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ============================================
@@ -49,6 +45,131 @@ const connectionStates = new Map();
 const messageStore = new Map();
 
 // ============================================
+// HELPER: Sanitize phone number
+// ============================================
+
+function sanitizePhoneNumber(phone) {
+    // Remove all non-digit characters
+    return phone.replace(/\D/g, '');
+}
+
+// ============================================
+// CREATE SOCKET - SIMPLIFIED & WORKING
+// ============================================
+
+async function createSocket(sessionId) {
+    const sessionDir = path.join(sessionPath, sessionId);
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { version } = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+        version,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+        },
+        printQRInTerminal: false, // IMPORTANT: Must be false for pair code
+        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        logger: pino({ level: 'silent' }),
+        syncFullHistory: false
+    });
+
+    sessions.set(sessionId, { sock, saveCreds });
+
+    // Handle connection updates
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        // QR Code received
+        if (qr) {
+            try {
+                const QRCode = require('qrcode');
+                const qrDataUrl = await QRCode.toDataURL(qr);
+                const qrBase64 = qrDataUrl.split(',')[1];
+
+                connectionStates.set(sessionId, {
+                    ...connectionStates.get(sessionId),
+                    status: 'qr_ready',
+                    qr: qrBase64,
+                    timestamp: Date.now()
+                });
+
+                console.log(`📱 QR Code ready for session: ${sessionId}`);
+            } catch (err) {
+                console.error('QR generation error:', err);
+            }
+        }
+
+        // Connected
+        if (connection === 'open') {
+            const userJid = sock.user?.id;
+            const phoneNumber = userJid?.split(':')[0]?.replace('@s.whatsapp.net', '');
+
+            connectionStates.set(sessionId, {
+                status: 'connected',
+                phone: phoneNumber || 'Unknown',
+                jid: userJid,
+                connectedAt: new Date().toISOString()
+            });
+
+            if (!messageStore.has(sessionId)) {
+                messageStore.set(sessionId, []);
+            }
+
+            console.log(`✅ Connected successfully: ${phoneNumber} (${sessionId})`);
+        }
+
+        // Connection closed
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+            console.log(`❌ Disconnected: ${sessionId} (Status: ${statusCode})`);
+
+            connectionStates.set(sessionId, {
+                ...connectionStates.get(sessionId),
+                status: 'disconnected'
+            });
+
+            if (shouldReconnect) {
+                console.log(`🔄 Reconnecting ${sessionId} in 5 seconds...`);
+                setTimeout(() => createSocket(sessionId), 5000);
+            } else {
+                sessions.delete(sessionId);
+                connectionStates.delete(sessionId);
+                console.log(`🗑️ Session ${sessionId} removed (logged out)`);
+            }
+        }
+    });
+
+    // Save credentials
+    sock.ev.on('creds.update', saveCreds);
+
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', (m) => {
+        const msg = m.messages[0];
+        if (!msg.key.fromMe && msg.message) {
+            const text = msg.message.conversation ||
+                msg.message.extendedTextMessage?.text ||
+                msg.message.imageMessage?.caption ||
+                '[Media Message]';
+
+            const messages = messageStore.get(sessionId) || [];
+            messages.push({
+                id: msg.key.id,
+                from: msg.key.remoteJid,
+                text: text,
+                timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000),
+                direction: 'received'
+            });
+            messageStore.set(sessionId, messages.slice(-100));
+        }
+    });
+
+    return sock;
+}
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 
@@ -56,278 +177,151 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        activeSessions: sessions.size
+        activeSessions: sessions.size,
+        connectedAccounts: Array.from(connectionStates.values())
+            .filter(s => s.status === 'connected').length
     });
 });
 
 // ============================================
-// BAILEYS SESSION MANAGEMENT
-// ============================================
-
-async function createSession(sessionId, method) {
-    try {
-        const sessionDir = path.join(sessionPath, sessionId);
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        const { version } = await fetchLatestBaileysVersion();
-        
-        const sock = makeWASocket({
-            version,
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
-            },
-            printQRInTerminal: true, // Print to terminal for debugging
-            browser: Browsers.ubuntu('Chrome'),
-            logger: pino({ level: 'silent' }),
-            syncFullHistory: false
-        });
-        
-        sessions.set(sessionId, { sock, state, saveCreds });
-        setupEventHandlers(sessionId, sock, saveCreds, method);
-        
-        return sock;
-    } catch (error) {
-        console.error(`Session creation error:`, error);
-        throw error;
-    }
-}
-
-function setupEventHandlers(sessionId, sock, saveCreds, method) {
-    
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        // Handle QR Code
-        if (qr) {
-            try {
-                const QRCode = require('qrcode');
-                const qrImage = await QRCode.toDataURL(qr);
-                const qrBase64 = qrImage.split(',')[1];
-                
-                connectionStates.set(sessionId, {
-                    ...connectionStates.get(sessionId),
-                    status: 'qr_ready',
-                    qr: qrBase64,
-                    method: method
-                });
-                console.log(`✅ QR Code ready for: ${sessionId}`);
-            } catch (err) {
-                console.error('QR generation error:', err);
-            }
-        }
-        
-        // Connection successful
-        if (connection === 'open') {
-            const userInfo = sock.user;
-            const phone = userInfo?.name || userInfo?.id?.split(':')[0] || 'Connected';
-            
-            connectionStates.set(sessionId, {
-                status: 'connected',
-                phone: phone,
-                connectedAt: new Date().toISOString(),
-                method: method
-            });
-            
-            if (!messageStore.has(sessionId)) {
-                messageStore.set(sessionId, []);
-            }
-            
-            console.log(`🎉 Connected: ${phone} (${sessionId})`);
-        }
-        
-        // Connection closed
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
-            console.log(`Connection closed: ${sessionId}, Status: ${statusCode}`);
-            
-            if (shouldReconnect) {
-                connectionStates.set(sessionId, {
-                    ...connectionStates.get(sessionId),
-                    status: 'reconnecting'
-                });
-                setTimeout(() => createSession(sessionId, method), 5000);
-            } else {
-                connectionStates.set(sessionId, {
-                    status: 'disconnected'
-                });
-            }
-        }
-    });
-    
-    sock.ev.on('creds.update', saveCreds);
-    
-    // Handle messages
-    sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.key.fromMe && msg.message) {
-            const text = msg.message.conversation || 
-                        msg.message.extendedTextMessage?.text || 
-                        'Media message';
-            
-            const messages = messageStore.get(sessionId) || [];
-            messages.push({
-                id: msg.key.id,
-                from: msg.key.remoteJid,
-                text: text,
-                timestamp: msg.messageTimestamp,
-                direction: 'received'
-            });
-            messageStore.set(sessionId, messages.slice(-100));
-        }
-    });
-}
-
-// ============================================
-// API: GET ALL ACCOUNTS
-// ============================================
-
-app.get('/api/accounts', (req, res) => {
-    const accounts = [];
-    connectionStates.forEach((state, id) => {
-        if (state.status === 'connected') {
-            accounts.push({
-                id: id,
-                phone: state.phone,
-                status: 'connected'
-            });
-        }
-    });
-    res.json(accounts);
-});
-
-// ============================================
-// API: PAIR CODE CONNECTION (PRIMARY METHOD)
+// API: PAIR CODE CONNECTION (PRIMARY)
 // ============================================
 
 app.post('/api/connect/pair', async (req, res) => {
     try {
-        const { phoneNumber } = req.body;
-        
+        let { phoneNumber } = req.body;
+
         if (!phoneNumber) {
             return res.status(400).json({
                 success: false,
-                message: 'Phone number is required'
+                error: 'Phone number is required'
             });
         }
-        
-        // Clean phone number
-        const cleanPhone = phoneNumber.replace(/[\s\+\-\(\)]/g, '');
-        console.log(`📱 Pair code request for: ${cleanPhone}`);
-        
+
+        // Sanitize phone number - remove all non-digits
+        phoneNumber = sanitizePhoneNumber(phoneNumber);
+
+        if (!phoneNumber || phoneNumber.length < 10) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid phone number. Please enter a valid number with country code.'
+            });
+        }
+
+        console.log(`📞 Pair code request for: ${phoneNumber}`);
+
         const sessionId = uuidv4();
-        
-        // Initialize state
+
+        // Initialize connection state
         connectionStates.set(sessionId, {
             status: 'initializing',
+            phone: phoneNumber,
             method: 'pair',
-            phone: cleanPhone
+            timestamp: Date.now()
         });
-        
-        // Create session
-        const sock = await createSession(sessionId, 'pair');
-        
-        // Wait a moment for socket to be ready
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
+
+        // Create socket
+        const sock = await createSocket(sessionId);
+
+        // Wait for socket to initialize
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
         // Request pairing code
         try {
-            const code = await sock.requestPairingCode(cleanPhone);
-            console.log(`🔑 Pair code generated: ${code}`);
-            
+            const code = await sock.requestPairingCode(phoneNumber);
+            console.log(`🔑 Pair Code Generated: ${code} for ${sessionId}`);
+
             connectionStates.set(sessionId, {
                 ...connectionStates.get(sessionId),
-                status: 'pair_ready',
-                pairCode: code
+                status: 'pair_code_ready',
+                pairCode: code,
+                timestamp: Date.now()
             });
-            
-            // Return immediately with pair code
+
             res.json({
                 success: true,
                 sessionId: sessionId,
                 pairCode: code,
-                status: 'pair_ready',
-                message: 'Pair code generated successfully'
+                phoneNumber: phoneNumber,
+                message: 'Pair code generated successfully',
+                instructions: 'Open WhatsApp > Linked Devices > Link a Device > Enter code manually'
             });
-            
+
         } catch (pairError) {
-            console.error('Pair code error:', pairError);
-            
-            // If pair code fails, fall back to QR code
+            console.error(`❌ Pair code error for ${sessionId}:`, pairError.message);
+
+            // Update state - wait for QR fallback
             connectionStates.set(sessionId, {
                 ...connectionStates.get(sessionId),
-                status: 'qr_fallback',
+                status: 'waiting_for_qr',
                 pairError: pairError.message
             });
-            
+
             res.json({
                 success: true,
                 sessionId: sessionId,
                 status: 'qr_fallback',
-                message: 'Pair code failed, QR code will be generated. Please wait...'
+                message: 'Pair code not available. QR code will be generated as fallback.',
+                error: pairError.message
             });
         }
-        
+
     } catch (error) {
         console.error('Connection error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to create connection: ' + error.message
+            error: error.message || 'Failed to create connection'
         });
     }
 });
 
 // ============================================
-// API: QR CODE CONNECTION (FALLBACK METHOD)
+// API: QR CODE CONNECTION (FALLBACK)
 // ============================================
 
 app.post('/api/connect/qr', async (req, res) => {
     try {
         const sessionId = uuidv4();
-        
+
         connectionStates.set(sessionId, {
             status: 'initializing',
-            method: 'qr'
+            method: 'qr',
+            timestamp: Date.now()
         });
-        
-        await createSession(sessionId, 'qr');
-        
-        // Wait for QR to be generated
+
+        await createSocket(sessionId);
+
+        // Wait for QR to generate
         let qrCode = null;
-        let attempts = 0;
-        
-        while (!qrCode && attempts < 10) {
+        for (let i = 0; i < 20; i++) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             const state = connectionStates.get(sessionId);
-            if (state && state.qr) {
+            if (state?.qr) {
                 qrCode = state.qr;
+                break;
             }
-            attempts++;
         }
-        
+
         if (qrCode) {
             res.json({
                 success: true,
                 sessionId: sessionId,
                 qr: qrCode,
-                status: 'qr_ready',
-                message: 'QR code generated'
+                status: 'qr_ready'
             });
         } else {
             res.json({
                 success: true,
                 sessionId: sessionId,
-                status: 'waiting_qr',
-                message: 'QR code is being generated'
+                status: 'generating',
+                message: 'QR code is being generated. Please wait...'
             });
         }
-        
+
     } catch (error) {
-        console.error('QR error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed: ' + error.message
+            error: error.message
         });
     }
 });
@@ -339,14 +333,14 @@ app.post('/api/connect/qr', async (req, res) => {
 app.get('/api/connection-status/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const state = connectionStates.get(sessionId);
-    
+
     if (!state) {
         return res.json({
             status: 'not_found',
             message: 'Session not found'
         });
     }
-    
+
     res.json({
         sessionId: sessionId,
         status: state.status,
@@ -359,38 +353,66 @@ app.get('/api/connection-status/:sessionId', (req, res) => {
 });
 
 // ============================================
+// API: GET ALL ACCOUNTS
+// ============================================
+
+app.get('/api/accounts', (req, res) => {
+    const accounts = [];
+
+    connectionStates.forEach((state, id) => {
+        if (state.status === 'connected') {
+            accounts.push({
+                id: id,
+                phone: state.phone,
+                status: 'connected',
+                connectedAt: state.connectedAt
+            });
+        }
+    });
+
+    res.json(accounts);
+});
+
+// ============================================
 // API: SEND MESSAGE
 // ============================================
 
 app.post('/api/send-message', async (req, res) => {
     try {
         const { id, to, text } = req.body;
-        
+
         if (!id || !to || !text) {
-            return res.status(400).json({ message: 'Missing fields' });
+            return res.status(400).json({ error: 'Missing required fields' });
         }
-        
+
         const session = sessions.get(id);
         if (!session?.sock) {
-            return res.status(404).json({ message: 'Not connected' });
+            return res.status(400).json({ error: 'Account not connected' });
         }
-        
-        const result = await session.sock.sendMessage(to, { text });
-        
+
+        // Format recipient
+        const jid = to.includes('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`;
+
+        const result = await session.sock.sendMessage(jid, { text });
+
+        // Store sent message
         const messages = messageStore.get(id) || [];
         messages.push({
             id: result.key.id,
-            to: to,
+            to: jid,
             text: text,
-            timestamp: Date.now() / 1000,
+            timestamp: Math.floor(Date.now() / 1000),
             direction: 'sent'
         });
         messageStore.set(id, messages.slice(-100));
-        
-        res.json({ success: true, messageId: result.key.id });
-        
+
+        res.json({
+            success: true,
+            messageId: result.key.id
+        });
+
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -400,7 +422,10 @@ app.post('/api/send-message', async (req, res) => {
 
 app.get('/api/messages/:accountId', (req, res) => {
     const messages = messageStore.get(req.params.accountId) || [];
-    res.json({ messages: messages.slice(-50) });
+    res.json({
+        accountId: req.params.accountId,
+        messages: messages.slice(-50)
+    });
 });
 
 // ============================================
@@ -411,26 +436,26 @@ app.post('/api/disconnect/:accountId', async (req, res) => {
     try {
         const { accountId } = req.params;
         const session = sessions.get(accountId);
-        
+
         if (session?.sock) {
             await session.sock.logout();
             await session.sock.end();
         }
-        
+
         sessions.delete(accountId);
         connectionStates.delete(accountId);
         messageStore.delete(accountId);
-        
-        // Clean files
-        const dir = path.join(sessionPath, accountId);
-        if (fs.existsSync(dir)) {
-            fs.rmSync(dir, { recursive: true, force: true });
+
+        // Clean session files
+        const sessionDir = path.join(sessionPath, accountId);
+        if (fs.existsSync(sessionDir)) {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
         }
-        
-        res.json({ success: true });
-        
+
+        res.json({ success: true, message: 'Disconnected successfully' });
+
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -447,14 +472,31 @@ app.get('*', (req, res) => {
 // ============================================
 
 app.listen(PORT, () => {
-    console.log(`\n✅ Server running on port ${PORT}`);
-    console.log(`📁 Sessions: ${sessionPath}\n`);
+    console.log(`
+    ╔════════════════════════════════════════╗
+    ║   WhatsApp Manager - Pair Code Ready  ║
+    ║   Port: ${PORT}                        ║
+    ║   Sessions: ${sessionPath}             ║
+    ╚════════════════════════════════════════╝
+    `);
 });
 
 // Keep alive for Render
-if (isRender) {
+if (process.env.RENDER) {
     setInterval(() => {
-        const http = require('http');
-        http.get(`http://localhost:${PORT}/health`, () => {}).on('error', () => {});
-    }, 840000); // 14 minutes
+        require('http').get(`http://localhost:${PORT}/health`, () => { }).on('error', () => { });
+    }, 840000);
 }
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    console.log('Shutting down...');
+    for (const [id, session] of sessions) {
+        try {
+            await session.sock.end();
+        } catch (e) {
+            // Ignore
+        }
+    }
+    process.exit(0);
+});
