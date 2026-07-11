@@ -1,6 +1,6 @@
 // ============================================
 // server.js - WhatsApp Multi-Account Backend
-// Render Deployment Ready
+// FIXED: Pair Code Priority + QR Code Support
 // ============================================
 
 require('dotenv').config();
@@ -11,7 +11,6 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
-// CORRECT Baileys import - using @whiskeysockets
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -22,115 +21,83 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const pino = require('pino');
-
-// Initialize Express
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 // ============================================
-// RENDER SPECIFIC SETUP
+// BASIC SETUP
 // ============================================
 
-// Use /tmp for sessions on Render (ephemeral storage)
 const isRender = process.env.RENDER === 'true';
 const sessionPath = isRender ? '/tmp/sessions' : './sessions';
 
-// Create sessions directory if it doesn't exist
 if (!fs.existsSync(sessionPath)) {
     fs.mkdirSync(sessionPath, { recursive: true });
-    console.log(`Created sessions directory at: ${sessionPath}`);
 }
 
-// Middleware
-app.use(cors({
-    origin: process.env.CORS_ORIGIN || '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    credentials: true
-}));
+app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ============================================
-// HEALTH CHECK (Render requires this)
-// ============================================
-
-app.get('/health', (req, res) => {
-    res.status(200).json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        sessions: sessions.size,
-        connectedAccounts: Array.from(connectionStates.values())
-            .filter(s => s.status === 'connected').length
-    });
-});
-
-// ============================================
 // STATE MANAGEMENT
 // ============================================
 
-const sessions = new Map(); // Map<sessionId, { sock, state, saveCreds }>
-const connectionStates = new Map(); // Map<sessionId, { status, qr, pairCode, phone }>
-const pendingConnections = new Map(); // Map<sessionId, { method, timeout }>
-const messageStore = new Map(); // Map<accountId, Array<messages>>
+const sessions = new Map();
+const connectionStates = new Map();
+const messageStore = new Map();
+
+// ============================================
+// HEALTH CHECK
+// ============================================
+
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        activeSessions: sessions.size
+    });
+});
 
 // ============================================
 // BAILEYS SESSION MANAGEMENT
 // ============================================
 
-async function createSession(sessionId) {
+async function createSession(sessionId, method) {
     try {
         const sessionDir = path.join(sessionPath, sessionId);
-        
-        // Use file-based auth state
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        const { version } = await fetchLatestBaileysVersion();
         
-        // Fetch latest Baileys version
-        const { version, isLatest } = await fetchLatestBaileysVersion();
-        console.log(`Using Baileys version: ${version}, isLatest: ${isLatest}`);
-        
-        // Create socket connection
         const sock = makeWASocket({
             version,
             auth: {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
             },
-            printQRInTerminal: false,
+            printQRInTerminal: true, // Print to terminal for debugging
             browser: Browsers.ubuntu('Chrome'),
             logger: pino({ level: 'silent' }),
             syncFullHistory: false
         });
         
-        // Store session data
-        sessions.set(sessionId, {
-            sock,
-            state,
-            saveCreds,
-            creds: state.creds,
-            keys: state.keys
-        });
+        sessions.set(sessionId, { sock, state, saveCreds });
+        setupEventHandlers(sessionId, sock, saveCreds, method);
         
-        // Set up event handlers
-        setupEventHandlers(sessionId, sock, saveCreds);
-        
-        console.log(`Session created: ${sessionId}`);
         return sock;
-        
     } catch (error) {
-        console.error(`Error creating session ${sessionId}:`, error);
+        console.error(`Session creation error:`, error);
         throw error;
     }
 }
 
-function setupEventHandlers(sessionId, sock, saveCreds) {
+function setupEventHandlers(sessionId, sock, saveCreds, method) {
     
-    // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // QR Code received
+        // Handle QR Code
         if (qr) {
             try {
                 const QRCode = require('qrcode');
@@ -139,30 +106,33 @@ function setupEventHandlers(sessionId, sock, saveCreds) {
                 
                 connectionStates.set(sessionId, {
                     ...connectionStates.get(sessionId),
-                    status: 'qr',
-                    qr: qrBase64
+                    status: 'qr_ready',
+                    qr: qrBase64,
+                    method: method
                 });
-                console.log(`QR Code generated for session: ${sessionId}`);
-            } catch (error) {
-                console.error('Error generating QR code:', error);
+                console.log(`✅ QR Code ready for: ${sessionId}`);
+            } catch (err) {
+                console.error('QR generation error:', err);
             }
         }
         
         // Connection successful
         if (connection === 'open') {
-            const phoneNumber = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+            const userInfo = sock.user;
+            const phone = userInfo?.name || userInfo?.id?.split(':')[0] || 'Connected';
+            
             connectionStates.set(sessionId, {
                 status: 'connected',
-                phone: sock.user?.name || phoneNumber,
-                connectedAt: new Date().toISOString()
+                phone: phone,
+                connectedAt: new Date().toISOString(),
+                method: method
             });
             
-            // Initialize message store
             if (!messageStore.has(sessionId)) {
                 messageStore.set(sessionId, []);
             }
             
-            console.log(`✅ Connected: ${sock.user?.name || phoneNumber} (${sessionId})`);
+            console.log(`🎉 Connected: ${phone} (${sessionId})`);
         }
         
         // Connection closed
@@ -170,270 +140,243 @@ function setupEventHandlers(sessionId, sock, saveCreds) {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
-            connectionStates.set(sessionId, {
-                ...connectionStates.get(sessionId),
-                status: 'disconnected'
-            });
-            
-            console.log(`Connection closed for ${sessionId}. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+            console.log(`Connection closed: ${sessionId}, Status: ${statusCode}`);
             
             if (shouldReconnect) {
-                // Attempt reconnection after delay
-                setTimeout(() => {
-                    createSession(sessionId).catch(err => {
-                        console.error(`Reconnection failed for ${sessionId}:`, err);
-                    });
-                }, 5000);
+                connectionStates.set(sessionId, {
+                    ...connectionStates.get(sessionId),
+                    status: 'reconnecting'
+                });
+                setTimeout(() => createSession(sessionId, method), 5000);
             } else {
-                // Clean up logged out session
-                sessions.delete(sessionId);
-                connectionStates.delete(sessionId);
-                console.log(`Session ${sessionId} logged out and removed`);
+                connectionStates.set(sessionId, {
+                    status: 'disconnected'
+                });
             }
         }
     });
     
-    // Handle credential updates
     sock.ev.on('creds.update', saveCreds);
     
-    // Handle incoming messages
+    // Handle messages
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
-        
         if (!msg.key.fromMe && msg.message) {
-            const messageText = msg.message.conversation || 
-                              msg.message.extendedTextMessage?.text || 
-                              msg.message.imageMessage?.caption ||
-                              'Media message';
+            const text = msg.message.conversation || 
+                        msg.message.extendedTextMessage?.text || 
+                        'Media message';
             
-            const messageData = {
+            const messages = messageStore.get(sessionId) || [];
+            messages.push({
                 id: msg.key.id,
                 from: msg.key.remoteJid,
-                text: messageText,
-                timestamp: msg.messageTimestamp || Date.now() / 1000,
+                text: text,
+                timestamp: msg.messageTimestamp,
                 direction: 'received'
-            };
-            
-            // Store message
-            const messages = messageStore.get(sessionId) || [];
-            messages.push(messageData);
-            messageStore.set(sessionId, messages.slice(-100)); // Keep last 100
+            });
+            messageStore.set(sessionId, messages.slice(-100));
         }
     });
 }
 
 // ============================================
-// API ROUTES
+// API: GET ALL ACCOUNTS
 // ============================================
 
-/**
- * GET /api/accounts
- * Returns all connected accounts
- */
 app.get('/api/accounts', (req, res) => {
     const accounts = [];
-    
-    connectionStates.forEach((state, sessionId) => {
+    connectionStates.forEach((state, id) => {
         if (state.status === 'connected') {
             accounts.push({
-                id: sessionId,
+                id: id,
                 phone: state.phone,
-                status: 'connected',
-                connectedAt: state.connectedAt
+                status: 'connected'
             });
         }
     });
-    
     res.json(accounts);
 });
 
-/**
- * POST /api/connect/qr
- * Initiates QR code connection
- */
+// ============================================
+// API: PAIR CODE CONNECTION (PRIMARY METHOD)
+// ============================================
+
+app.post('/api/connect/pair', async (req, res) => {
+    try {
+        const { phoneNumber } = req.body;
+        
+        if (!phoneNumber) {
+            return res.status(400).json({
+                success: false,
+                message: 'Phone number is required'
+            });
+        }
+        
+        // Clean phone number
+        const cleanPhone = phoneNumber.replace(/[\s\+\-\(\)]/g, '');
+        console.log(`📱 Pair code request for: ${cleanPhone}`);
+        
+        const sessionId = uuidv4();
+        
+        // Initialize state
+        connectionStates.set(sessionId, {
+            status: 'initializing',
+            method: 'pair',
+            phone: cleanPhone
+        });
+        
+        // Create session
+        const sock = await createSession(sessionId, 'pair');
+        
+        // Wait a moment for socket to be ready
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Request pairing code
+        try {
+            const code = await sock.requestPairingCode(cleanPhone);
+            console.log(`🔑 Pair code generated: ${code}`);
+            
+            connectionStates.set(sessionId, {
+                ...connectionStates.get(sessionId),
+                status: 'pair_ready',
+                pairCode: code
+            });
+            
+            // Return immediately with pair code
+            res.json({
+                success: true,
+                sessionId: sessionId,
+                pairCode: code,
+                status: 'pair_ready',
+                message: 'Pair code generated successfully'
+            });
+            
+        } catch (pairError) {
+            console.error('Pair code error:', pairError);
+            
+            // If pair code fails, fall back to QR code
+            connectionStates.set(sessionId, {
+                ...connectionStates.get(sessionId),
+                status: 'qr_fallback',
+                pairError: pairError.message
+            });
+            
+            res.json({
+                success: true,
+                sessionId: sessionId,
+                status: 'qr_fallback',
+                message: 'Pair code failed, QR code will be generated. Please wait...'
+            });
+        }
+        
+    } catch (error) {
+        console.error('Connection error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to create connection: ' + error.message
+        });
+    }
+});
+
+// ============================================
+// API: QR CODE CONNECTION (FALLBACK METHOD)
+// ============================================
+
 app.post('/api/connect/qr', async (req, res) => {
     try {
         const sessionId = uuidv4();
         
-        // Initialize connection state
         connectionStates.set(sessionId, {
             status: 'initializing',
             method: 'qr'
         });
         
-        // Create session - QR will be generated via event handler
-        await createSession(sessionId);
+        await createSession(sessionId, 'qr');
         
-        // Wait briefly for QR to be generated
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Wait for QR to be generated
+        let qrCode = null;
+        let attempts = 0;
         
-        // Get the generated QR code
-        const state = connectionStates.get(sessionId);
+        while (!qrCode && attempts < 10) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            const state = connectionStates.get(sessionId);
+            if (state && state.qr) {
+                qrCode = state.qr;
+            }
+            attempts++;
+        }
         
-        if (state && state.qr) {
-            // QR is ready
+        if (qrCode) {
             res.json({
+                success: true,
                 sessionId: sessionId,
-                qr: state.qr,
+                qr: qrCode,
                 status: 'qr_ready',
-                message: 'QR code generated successfully'
+                message: 'QR code generated'
             });
         } else {
-            // QR not ready yet, but session is created
             res.json({
+                success: true,
                 sessionId: sessionId,
-                status: 'waiting_for_qr',
-                message: 'Session created, waiting for QR code'
+                status: 'waiting_qr',
+                message: 'QR code is being generated'
             });
         }
         
-        // Set timeout for connection (5 minutes)
-        const timeout = setTimeout(() => {
-            const currentState = connectionStates.get(sessionId);
-            if (currentState && currentState.status !== 'connected') {
-                connectionStates.set(sessionId, {
-                    status: 'timeout',
-                    method: 'qr'
-                });
-                sessions.delete(sessionId);
-            }
-            pendingConnections.delete(sessionId);
-        }, 300000); // 5 minutes
-        
-        pendingConnections.set(sessionId, { method: 'qr', timeout });
-        
     } catch (error) {
-        console.error('QR connection error:', error);
+        console.error('QR error:', error);
         res.status(500).json({
-            message: 'Failed to create QR connection',
-            error: error.message
+            success: false,
+            message: 'Failed: ' + error.message
         });
     }
 });
 
-/**
- * POST /api/connect/pair
- * Initiates pair code connection
- */
-app.post('/api/connect/pair', async (req, res) => {
-    try {
-        const sessionId = uuidv4();
-        const phoneNumber = req.body.phoneNumber;
-        
-        if (!phoneNumber) {
-            return res.status(400).json({ message: 'Phone number is required' });
-        }
-        
-        // Initialize connection state
-        connectionStates.set(sessionId, {
-            status: 'initializing',
-            method: 'pair'
-        });
-        
-        // Create session first
-        await createSession(sessionId);
-        
-        // Get socket
-        const sock = sessions.get(sessionId)?.sock;
-        if (!sock) {
-            throw new Error('Failed to create session');
-        }
-        
-        // Request pairing code
-        const code = await sock.requestPairingCode(phoneNumber);
-        
-        // Update state with pair code
-        connectionStates.set(sessionId, {
-            ...connectionStates.get(sessionId),
-            status: 'pairing',
-            pairCode: code
-        });
-        
-        // Set timeout
-        const timeout = setTimeout(() => {
-            const state = connectionStates.get(sessionId);
-            if (state && state.status !== 'connected') {
-                connectionStates.set(sessionId, {
-                    status: 'timeout',
-                    method: 'pair'
-                });
-                sessions.delete(sessionId);
-            }
-            pendingConnections.delete(sessionId);
-        }, 180000);
-        
-        pendingConnections.set(sessionId, { method: 'pair', timeout });
-        
-        res.json({
-            sessionId,
-            pairCode: code,
-            status: 'pairing',
-            message: 'Pair code generated'
-        });
-        
-    } catch (error) {
-        console.error('Pair code connection error:', error);
-        res.status(500).json({
-            message: 'Failed to create pair code connection',
-            error: error.message
-        });
-    }
-});
+// ============================================
+// API: CHECK CONNECTION STATUS
+// ============================================
 
-/**
- * GET /api/connection-status/:sessionId
- * Polls connection status
- */
 app.get('/api/connection-status/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const state = connectionStates.get(sessionId);
     
     if (!state) {
-        return res.status(404).json({
-            status: 'error',
+        return res.json({
+            status: 'not_found',
             message: 'Session not found'
         });
     }
     
-    // Return complete state including QR if available
     res.json({
         sessionId: sessionId,
         status: state.status,
         qr: state.qr || null,
         pairCode: state.pairCode || null,
         phone: state.phone || null,
-        id: sessionId
+        id: sessionId,
+        method: state.method
     });
 });
 
-/**
- * POST /api/send-message
- * Sends a WhatsApp message
- */
+// ============================================
+// API: SEND MESSAGE
+// ============================================
+
 app.post('/api/send-message', async (req, res) => {
     try {
         const { id, to, text } = req.body;
         
-        // Validate inputs
         if (!id || !to || !text) {
-            return res.status(400).json({
-                message: 'Missing required fields: id, to, text'
-            });
+            return res.status(400).json({ message: 'Missing fields' });
         }
         
-        // Get session
         const session = sessions.get(id);
-        if (!session || !session.sock) {
-            return res.status(404).json({
-                message: 'Account not connected or session not found'
-            });
+        if (!session?.sock) {
+            return res.status(404).json({ message: 'Not connected' });
         }
         
-        // Send message
-        const sock = session.sock;
-        const result = await sock.sendMessage(to, { text });
+        const result = await session.sock.sendMessage(to, { text });
         
-        // Store sent message
         const messages = messageStore.get(id) || [];
         messages.push({
             id: result.key.id,
@@ -444,80 +387,50 @@ app.post('/api/send-message', async (req, res) => {
         });
         messageStore.set(id, messages.slice(-100));
         
-        res.json({
-            success: true,
-            messageId: result.key.id,
-            timestamp: result.messageTimestamp
-        });
+        res.json({ success: true, messageId: result.key.id });
         
     } catch (error) {
-        console.error('Send message error:', error);
-        res.status(500).json({
-            message: 'Failed to send message',
-            error: error.message
-        });
+        res.status(500).json({ message: error.message });
     }
 });
 
-/**
- * GET /api/messages/:accountId
- * Returns message history
- */
+// ============================================
+// API: GET MESSAGES
+// ============================================
+
 app.get('/api/messages/:accountId', (req, res) => {
-    const { accountId } = req.params;
-    const messages = messageStore.get(accountId) || [];
-    
-    res.json({
-        accountId,
-        messages: messages.slice(-50),
-        total: messages.length
-    });
+    const messages = messageStore.get(req.params.accountId) || [];
+    res.json({ messages: messages.slice(-50) });
 });
 
-/**
- * POST /api/disconnect/:accountId
- * Disconnects an account
- */
+// ============================================
+// API: DISCONNECT
+// ============================================
+
 app.post('/api/disconnect/:accountId', async (req, res) => {
     try {
         const { accountId } = req.params;
         const session = sessions.get(accountId);
         
-        if (session && session.sock) {
-            try {
-                await session.sock.logout();
-                await session.sock.end();
-            } catch (err) {
-                console.error(`Error during logout for ${accountId}:`, err);
-            }
+        if (session?.sock) {
+            await session.sock.logout();
+            await session.sock.end();
         }
         
-        // Clean up state
         sessions.delete(accountId);
         connectionStates.delete(accountId);
         messageStore.delete(accountId);
         
-        // Clean up session files
-        const sessionDir = path.join(sessionPath, accountId);
-        try {
-            if (fs.existsSync(sessionDir)) {
-                fs.rmSync(sessionDir, { recursive: true, force: true });
-            }
-        } catch (err) {
-            console.error('Error deleting session files:', err);
+        // Clean files
+        const dir = path.join(sessionPath, accountId);
+        if (fs.existsSync(dir)) {
+            fs.rmSync(dir, { recursive: true, force: true });
         }
         
-        res.json({
-            success: true,
-            message: 'Account disconnected successfully'
-        });
+        res.json({ success: true });
         
     } catch (error) {
-        console.error('Disconnect error:', error);
-        res.status(500).json({
-            message: 'Failed to disconnect account',
-            error: error.message
-        });
+        res.status(500).json({ message: error.message });
     }
 });
 
@@ -525,93 +438,23 @@ app.post('/api/disconnect/:accountId', async (req, res) => {
 // SERVE FRONTEND
 // ============================================
 
-// Serve static files from public directory
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Serve index.html for all other routes (SPA support)
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
-
-// ============================================
-// ERROR HANDLING
-// ============================================
-
-app.use((err, req, res, next) => {
-    console.error('Unhandled error:', err);
-    res.status(500).json({
-        message: 'Internal server error',
-        error: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
-    });
-});
-
-// ============================================
-// KEEP ALIVE FOR RENDER FREE TIER
-// ============================================
-
-function startKeepAlive() {
-    if (isRender) {
-        setInterval(() => {
-            const http = require('http');
-            http.get(`http://localhost:${PORT}/health`, (res) => {
-                // Silently ping to prevent sleep
-            }).on('error', () => {
-                // Ignore errors
-            });
-        }, 14 * 60 * 1000); // Every 14 minutes
-        console.log('Keep-alive pings enabled');
-    }
-}
 
 // ============================================
 // START SERVER
 // ============================================
 
 app.listen(PORT, () => {
-    console.log(`
-    ╔════════════════════════════════════════════╗
-    ║     WhatsApp Manager - Render Deploy       ║
-    ║     Port: ${PORT}                           ║
-    ║     Environment: ${process.env.NODE_ENV || 'production'}    ║
-    ║     Sessions Path: ${sessionPath}           ║
-    ║     Status: Running                         ║
-    ╚════════════════════════════════════════════╝
-    `);
-    
-    // Start keep-alive pings
-    startKeepAlive();
+    console.log(`\n✅ Server running on port ${PORT}`);
+    console.log(`📁 Sessions: ${sessionPath}\n`);
 });
 
-// ============================================
-// GRACEFUL SHUTDOWN
-// ============================================
-
-process.on('SIGTERM', async () => {
-    console.log('SIGTERM received. Closing all sessions...');
-    
-    for (const [sessionId, session] of sessions) {
-        try {
-            await session.sock.end();
-            console.log(`Closed session: ${sessionId}`);
-        } catch (error) {
-            console.error(`Error closing session ${sessionId}:`, error);
-        }
-    }
-    
-    console.log('All sessions closed. Exiting...');
-    process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-    console.log('SIGINT received. Closing all sessions...');
-    
-    for (const [sessionId, session] of sessions) {
-        try {
-            await session.sock.end();
-        } catch (error) {
-            console.error(`Error closing session ${sessionId}:`, error);
-        }
-    }
-    
-    process.exit(0);
-});
+// Keep alive for Render
+if (isRender) {
+    setInterval(() => {
+        const http = require('http');
+        http.get(`http://localhost:${PORT}/health`, () => {}).on('error', () => {});
+    }, 840000); // 14 minutes
+}
