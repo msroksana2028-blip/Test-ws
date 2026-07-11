@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: whatsapp-manager
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RENDER
+        value: true
+      - key: PORT
+        value: 3000
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: SESSIONS_DIR
+        value: /tmp/sessions
+    disk:
+      name: sessions
+      mountPath: /tmp/sessions
+      sizeGB: 1
+    healthCheckPath: /health
+    autoDeploy: production
